@@ -157,9 +157,69 @@ Self-driven — **no `--teleop`**. Prerequisite: `xense.taccap` importable in th
 lerobot-teleoperate \
     --robot.type=bi_taccap_gripper \
     --robot.id=0 \
+    --robot.enable_tracker=true \
+    --robot.enable_head_camera=false \
     --fps=30 \
     --display_data=true
 ```
+
+`enable_tracker=true` makes the live Tracker observations available (and is already
+the default). CSV capture is enabled separately by
+`tracker_validation_output_dir`; if the startup config prints that field as `None`,
+live `left_tracker.*`/`right_tracker.*` values may still appear but no validation CSV
+will be written.
+
+### PICO/NOKOV Tracker validation (teleoperate only)
+
+Tracker trajectory, translation and rotation accuracy can be measured with the real
+`Pico4TrackerReader` used by `lerobot-teleoperate`; `lerobot-record` is not needed.
+Enable the opt-in sidecar and disable unrelated gripper/camera hardware:
+
+```bash
+lerobot-teleoperate \
+    --robot.type=bi_taccap_gripper \
+    --robot.id=0 \
+    --robot.enable_tracker=true \
+    --robot.enable_head_camera=false \
+    --robot.enable_tactile=false \
+    --robot.left_enable_gripper=false \
+    --robot.right_enable_gripper=false \
+    --robot.left_enable_wrist_camera=false \
+    --robot.right_enable_wrist_camera=false \
+    --robot.left_tracker_serial=LEFT_SERIAL \
+    --robot.right_tracker_serial=RIGHT_SERIAL \
+    --robot.tracker_validation_output_dir=/home/zdh/nokov_ego_hand_validation/sessions/SESSION/pico \
+    --fps=30 \
+    --display_data=true
+```
+
+The sidecar records each new PICO state-packet motion timestamp (about 90 Hz), not
+merely the 30 Hz visualization samples. The binding uses `Motion.timeStampNs` when it
+is positive and otherwise the enclosing state packet's `timeStampNs`; the pose and
+timestamp are copied under one native mutex. It writes:
+
+- `pico_head_poses.csv`: raw PICO headset pose and headset timestamp;
+- `pico_tracker_poses.csv`: left/right serial, raw PICO pose, FLU world Tracker pose,
+  final TCP pose, velocity/acceleration and duplicate/stale diagnostics;
+- `capture_metadata.json`: row counts, missing/duplicate/stale counts, serial mapping,
+  coordinate conventions and atomicity limitations;
+- `events.csv`: start/end host clocks.
+
+The unprefixed pose columns are the untouched SDK frame (`+X` right, `+Y` up, `+Z`
+toward the user, quaternion XYZW). `world_*` is the exact remap performed in
+`tracker.py`; `tcp_*` additionally applies this robot's configured Tracker-to-TCP
+mount transform. The headset stream is recorded even when
+`--robot.enable_head_camera=false`, so this mode does not decode or record headset
+images.
+
+Press `Ctrl+C` to close the CSVs and write metadata. Existing non-empty outputs are
+refused by default; use a new session directory for every run. The sidecar is off when
+`tracker_validation_output_dir` is omitted, and tests verify that enabling it does not
+add or change observation/action fields.
+
+Run NOKOV's three-rigid-body capture in a second terminal. The full calibration and
+evaluation procedure is in
+`/home/zdh/nokov_ego_hand_validation/docs/pico_tracker_nokov_ground_truth_development_zh.md`.
 
 **Record a dataset** (`self_driven_record_loop`, shifted-frame). With the trackers
 powered on, 6-DoF pose is recorded automatically (both trackers auto-assigned by SN);

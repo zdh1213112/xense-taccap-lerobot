@@ -151,6 +151,17 @@ class BiTaccapGripperConfig(RobotConfig):
     tracker_wait_timeout: float = 10.0
     """Seconds to wait for the first valid tracker pose at connect time (both sides)."""
 
+    tracker_validation_output_dir: str | None = None
+    """Optional PICO/NOKOV validation sidecar directory.
+
+    When set, the actual native-rate ``Pico4TrackerReader`` instances used by
+    ``lerobot-teleoperate`` write raw PICO, FLU tracker and final TCP poses plus
+    device timestamps. ``None`` keeps the normal teleoperation path unchanged.
+    This sidecar is not part of the observation/action schema or a dataset."""
+
+    tracker_validation_overwrite: bool = False
+    """Allow replacing existing files in ``tracker_validation_output_dir``."""
+
     tactile_fps: int = 30
     tactile_output_types: list[str] = field(default_factory=lambda: ["rectify"])
     """The **recorded** tactile stream, applied to every discovered sensor. Exactly
@@ -245,6 +256,11 @@ class BiTaccapGripperConfig(RobotConfig):
             # Delegate to the camera config so there is one definition of what
             # a valid mode is, rather than a copy here that can drift from it.
             build_head_camera_configs(self)
+        if self.tracker_validation_output_dir is not None:
+            if not self.tracker_validation_output_dir.strip():
+                raise ValueError("tracker_validation_output_dir must not be blank")
+            if not self.enable_tracker:
+                raise ValueError("tracker_validation_output_dir requires --robot.enable_tracker=true")
         # One recorded stream per sensor: observation_features declares a single
         # (H, W, 3) per tactile camera, so a second recorded type would silently
         # hand build_dataset_frame a dict instead of an image. Extra live views

@@ -49,6 +49,7 @@ from functools import cached_property
 from typing import Any
 
 from lerobot.cameras.utils import make_cameras_from_configs
+from lerobot.teleoperators.pico4.validation_sidecar import PicoTrackingValidationSidecar
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.utils.robot_utils import get_logger
 
@@ -140,6 +141,7 @@ class BiTaccapGripper(Robot):
         self._gripper: dict[str, Any] = dict.fromkeys(_SIDES)  # Leader/FollowerGripper
         self._endpoints: dict[str, Any] = dict.fromkeys(_SIDES)  # GripperEndpoints
         self._tracker: dict[str, Pico4TrackerReader | None] = dict.fromkeys(_SIDES)
+        self._tracker_validation_sidecar: PicoTrackingValidationSidecar | None = None
         # Auto-discover tactile + wrist cameras and build their configs so the
         # observation schema is ready before connect(). Tactiles are paired to a
         # gripper by USB hub, so this scans the serial bus (grippers must be
@@ -397,6 +399,14 @@ class BiTaccapGripper(Robot):
         self._cam_guard.reset()  # a reconnect must not inherit the last session's losses
         self._enc_guard.reset()
 
+        if self.config.tracker_validation_output_dir is not None:
+            self._tracker_validation_sidecar = PicoTrackingValidationSidecar(
+                self.config.tracker_validation_output_dir,
+                self._tracker_sn_by_side,
+                overwrite=self.config.tracker_validation_overwrite,
+            )
+            self.logger.info(f"PICO tracker validation sidecar: {self._tracker_validation_sidecar.output_dir}")
+
         # 1. Grippers — auto-discovered by serial (side + role) on the bus.
         enabled_gripper_sides = tuple(s for s in _SIDES if getattr(self.config, f"{s}_enable_gripper"))
         grippers = disco.discover_grippers(self._role) if enabled_gripper_sides else {}
@@ -440,11 +450,20 @@ class BiTaccapGripper(Robot):
                     tracker_to_ee_quat=ee_quat,
                     device_wait_timeout=self.config.tracker_wait_timeout,
                     logger_name=f"{self.config.id}-{side}",
+                    validation_callback=(
+                        self._tracker_validation_sidecar.record_tracker
+                        if self._tracker_validation_sidecar is not None
+                        else None
+                    ),
+                    validation_side=side,
                 )
                 # No init-pose alignment — see the note in the config module.
                 tracker.connect()
                 self._tracker[side] = tracker
                 self.logger.info(f"  [{side}] ✅ Pico4 tracker connected (world frame)")
+
+        if self._tracker_validation_sidecar is not None:
+            self._tracker_validation_sidecar.start_head_capture()
 
         # 3. Cameras (tactile + wrist, auto-discovered in __init__).
         #    Pre-warm the config cache sequentially first so the parallel connect
@@ -473,6 +492,9 @@ class BiTaccapGripper(Robot):
         in the teleop script skipped such a robot entirely, leaking the gripper
         serial ports and the xrt session along with the cameras.
         """
+        if self._tracker_validation_sidecar is not None:
+            self._tracker_validation_sidecar.stop_head_capture()
+
         disconnect_cameras_parallel(self.cameras, self.logger)
 
         for side in _SIDES:
@@ -494,6 +516,13 @@ class BiTaccapGripper(Robot):
                 # Gripper has no explicit close; transport released on GC.
                 self._gripper[side] = None
             self._endpoints[side] = None
+
+        if self._tracker_validation_sidecar is not None:
+            try:
+                self._tracker_validation_sidecar.close()
+            except Exception as e:  # pragma: no cover - filesystem failure during teardown
+                self.logger.error(f"PICO tracker validation sidecar close error: {e}")
+            self._tracker_validation_sidecar = None
 
         self._is_connected = False
 

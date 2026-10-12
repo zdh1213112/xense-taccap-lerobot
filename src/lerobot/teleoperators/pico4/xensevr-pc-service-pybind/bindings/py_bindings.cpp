@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/chrono.h>
 #include <pybind11/stl.h>
+#include <algorithm>
 #include <thread>
 #include <iostream>
 #include <mutex>
@@ -41,6 +42,8 @@ std::array<std::array<double, 6>, 3> MotionTrackerVelocity;  // Velocity and ang
 std::array<std::array<double, 6>, 3> MotionTrackerAcceleration;  // Acceleration and angular acceleration for each joint
 std::array<std::string, 3> MotionTrackerSerialNumbers;  // Serial numbers of the motion trackers
 int64_t MotionTimeStampNs = 0;  // Motion data timestamp
+uint64_t MotionSequence = 0;  // Local packet sequence for diagnostics
+std::string MotionTimestampSource = "unavailable";
 int NumMotionDataAvailable = 0;  // number of motion trackers
 
 
@@ -301,8 +304,22 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
                     auto& motion = value["Motion"];
                     {
                         std::lock_guard<std::mutex> lock(motionMutex);
-                        if (motion.contains("timeStampNs")) {
-                            MotionTimeStampNs = motion["timeStampNs"].get<int64_t>();
+                        const int64_t motionTimestamp = motion.contains("timeStampNs")
+                            ? motion["timeStampNs"].get<int64_t>()
+                            : 0;
+                        if (motionTimestamp > 0) {
+                            MotionTimeStampNs = motionTimestamp;
+                            MotionTimestampSource = "Motion.timeStampNs";
+                        } else if (value.contains("timeStampNs")) {
+                            // Current PICO runtime publishes changing Motion poses but
+                            // leaves Motion.timeStampNs at zero. The enclosing state
+                            // packet timestamp belongs to this same callback payload,
+                            // so publish it atomically with the Motion arrays.
+                            MotionTimeStampNs = value["timeStampNs"].get<int64_t>();
+                            MotionTimestampSource = "packet.timeStampNs";
+                        } else {
+                            MotionTimeStampNs = 0;
+                            MotionTimestampSource = "unavailable";
                         }
                         if (motion.contains("joints") && motion["joints"].is_array()) {
                             auto joints = motion["joints"];
@@ -332,6 +349,7 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
                             }
 
                         }
+                        ++MotionSequence;
                     }
                 }
             }
@@ -557,6 +575,40 @@ int64_t getMotionTimeStampNs() {
     return MotionTimeStampNs;
 }
 
+py::dict getMotionTrackerSnapshot() {
+    // Copy the complete Motion packet while holding the same mutex used by the
+    // SDK callback.  Reading the existing getters one by one cannot guarantee
+    // a coherent packet at 90 Hz: the callback may publish a new timestamp
+    // between any two Python calls.
+    std::lock_guard<std::mutex> lock(motionMutex);
+    const int count = std::max(0, std::min(NumMotionDataAvailable, 3));
+    std::vector<std::array<double, 7>> poses;
+    std::vector<std::array<double, 6>> velocities;
+    std::vector<std::array<double, 6>> accelerations;
+    std::vector<std::string> serialNumbers;
+    poses.reserve(count);
+    velocities.reserve(count);
+    accelerations.reserve(count);
+    serialNumbers.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        poses.push_back(MotionTrackerPose[i]);
+        velocities.push_back(MotionTrackerVelocity[i]);
+        accelerations.push_back(MotionTrackerAcceleration[i]);
+        serialNumbers.push_back(MotionTrackerSerialNumbers[i]);
+    }
+
+    py::dict result;
+    result["timestamp_ns"] = MotionTimeStampNs;
+    result["timestamp_source"] = MotionTimestampSource;
+    result["sequence"] = MotionSequence;
+    result["count"] = count;
+    result["poses"] = poses;
+    result["velocities"] = velocities;
+    result["accelerations"] = accelerations;
+    result["serials"] = serialNumbers;
+    return result;
+}
+
 bool hasPicoCameraFrame(int eyeIndex) {
     if (eyeIndex < 0 || eyeIndex >= static_cast<int>(PicoCameraFrames.size())) {
         return false;
@@ -674,6 +726,7 @@ PYBIND11_MODULE(xensevr_pc_service_sdk, m) {
     m.def("get_motion_tracker_acceleration", &getMotionTrackerAcceleration, "Get the motion tracker acceleration data (3 trackers, 6 values each: ax,ay,az,wax,way,waz).");
     m.def("get_motion_tracker_serial_numbers", &getMotionTrackerSerialNumbers, "Get the serial numbers of the motion trackers.");
     m.def("get_motion_timestamp_ns", &getMotionTimeStampNs, "Get the motion data timestamp in nanoseconds.");
+    m.def("get_motion_tracker_snapshot", &getMotionTrackerSnapshot, "Atomically get one complete motion-tracker packet under the motion mutex.");
 
     // Pico eye camera functions. eye_index: 0 = left, 1 = right.
     m.def("has_pico_camera_frame", &hasPicoCameraFrame, "Check whether a Pico camera frame has been received for an eye.");

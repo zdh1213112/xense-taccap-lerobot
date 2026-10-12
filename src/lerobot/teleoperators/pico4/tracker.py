@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -150,6 +151,10 @@ class Pico4TrackerReader:
             untouched xrt-native frame.
         poll_hz: Background poll rate. Default ``TRACKER_POLL_HZ`` (90).
         logger_name: Optional logger name suffix.
+        validation_callback: Optional callback receiving the exact native-rate
+            raw/world/TCP sample produced by this reader. Used only by the
+            explicitly enabled validation sidecar.
+        validation_side: Stable physical-side label attached to callback rows.
     """
 
     # The xrt singleton and its hold count now live in ``xrt_session`` — the
@@ -172,6 +177,8 @@ class Pico4TrackerReader:
         pico_to_world: bool = True,
         poll_hz: float = TRACKER_POLL_HZ,
         logger_name: str | None = None,
+        validation_callback: Callable[[dict[str, Any]], None] | None = None,
+        validation_side: str | None = None,
     ):
         """Init does NOT touch the network — call ``connect()`` for that.
 
@@ -189,6 +196,8 @@ class Pico4TrackerReader:
         self.hemisphere_fix = bool(hemisphere_fix)
         self.pico_to_world = bool(pico_to_world)
         self._poll_period = 1.0 / max(1e-3, float(poll_hz))
+        self._validation_callback = validation_callback
+        self._validation_side = validation_side or "unknown"
 
         # Pre-build the 4x4 Pico→world frame remap (pure rotation; inverse =
         # transpose). Applied to every raw tracker pose when pico_to_world.
@@ -223,6 +232,10 @@ class Pico4TrackerReader:
             None  # [x,y,z,qw,qx,qy,qz] after rigid + (optional align) + hemisphere
         )
         self._latest_ts: float | None = None  # time.monotonic() of latest valid pose
+        self._latest_device_timestamp_ns: int | None = None
+        self._latest_host_receive_perf_ns: int | None = None
+        self._latest_host_receive_unix_ns: int | None = None
+        self._latest_motion_sequence: int = 0
         self._stale_warned: bool = False  # gate stale-pose warning to once per drop-out
         self._missing_warned_at: float = 0.0  # throttle missing-SN warning
 
@@ -432,6 +445,10 @@ class Pico4TrackerReader:
             self._latest_ee_wxyz = None
             self._latest_world_tracker_wxyz = None
             self._latest_ts = None
+            self._latest_device_timestamp_ns = None
+            self._latest_host_receive_perf_ns = None
+            self._latest_host_receive_unix_ns = None
+            self._latest_motion_sequence = 0
             self._align_matrix = None
         self._ee_init_matrix = None
 
@@ -452,30 +469,72 @@ class Pico4TrackerReader:
         prev_ee_quat: np.ndarray | None = None
 
         while not self._stop_evt.wait(self._poll_period):
-            try:
-                n = xrt.num_motion_data_available()
-            except Exception as e:  # pragma: no cover — defensive
-                self.logger.warn(f"num_motion_data_available failed: {e}")
-                continue
+            motion_timestamp_ns: int | None = None
+            velocities: list = []
+            accelerations: list = []
+            if self._validation_callback is not None:
+                snapshot = None
+                try:
+                    atomic_getter = getattr(xrt, "get_motion_tracker_snapshot", None)
+                    if callable(atomic_getter):
+                        packet = atomic_getter()
+                        snapshot = (
+                            int(packet["timestamp_ns"]),
+                            int(packet["count"]),
+                            packet["poses"],
+                            packet["serials"],
+                            packet["velocities"],
+                            packet["accelerations"],
+                        )
+                    else:  # Compatibility with an older, not-yet-rebuilt binding.
+                        for _attempt in range(6):
+                            before = int(xrt.get_motion_timestamp_ns())
+                            n = xrt.num_motion_data_available()
+                            poses = xrt.get_motion_tracker_pose()
+                            sns = xrt.get_motion_tracker_serial_numbers()
+                            velocities = xrt.get_motion_tracker_velocity()
+                            accelerations = xrt.get_motion_tracker_acceleration()
+                            after = int(xrt.get_motion_timestamp_ns())
+                            if before == after and after > 0:
+                                snapshot = (after, n, poses, sns, velocities, accelerations)
+                                break
+                except Exception as e:  # pragma: no cover — defensive
+                    self.logger.warn(f"validation tracker snapshot query failed: {e}")
+                    self._emit_validation_missing("snapshot_query_failed")
+                    continue
+                if snapshot is None or snapshot[0] <= 0:
+                    self._emit_validation_missing("inconsistent_snapshot")
+                    continue
+                motion_timestamp_ns, n, poses, sns, velocities, accelerations = snapshot
+            else:
+                try:
+                    n = xrt.num_motion_data_available()
+                except Exception as e:  # pragma: no cover — defensive
+                    self.logger.warn(f"num_motion_data_available failed: {e}")
+                    continue
 
             if n == 0:
                 self._maybe_warn_missing()
+                self._emit_validation_missing("no_motion_data")
                 continue
 
-            try:
-                poses = xrt.get_motion_tracker_pose()
-                sns = xrt.get_motion_tracker_serial_numbers()
-            except Exception as e:  # pragma: no cover — defensive
-                self.logger.warn(f"tracker pose query failed: {e}")
-                continue
+            if self._validation_callback is None:
+                try:
+                    poses = xrt.get_motion_tracker_pose()
+                    sns = xrt.get_motion_tracker_serial_numbers()
+                except Exception as e:  # pragma: no cover — defensive
+                    self.logger.warn(f"tracker pose query failed: {e}")
+                    continue
 
             # The tracker index might have shifted if other trackers
             # plugged/unplugged between connect and now. Re-resolve.
             idx = self._resolve_current_index(sns, n)
             if idx is None:
                 self._maybe_warn_missing()
+                self._emit_validation_missing("serial_not_visible")
                 continue
             if idx >= len(poses):
+                self._emit_validation_missing("pose_index_out_of_range")
                 continue
 
             raw_xyzw = np.asarray(poses[idx], dtype=np.float64)
@@ -519,12 +578,73 @@ class Pico4TrackerReader:
                     ee_pose[3:7] = -q_new
             prev_ee_quat = ee_pose[3:7].copy()
 
+            host_receive_perf_ns = time.perf_counter_ns()
+            host_receive_unix_ns = time.time_ns()
+            now_monotonic = time.monotonic()
+            duplicate = bool(
+                motion_timestamp_ns is not None and motion_timestamp_ns == self._latest_device_timestamp_ns
+            )
+            if self._validation_callback is None or not duplicate:
+                latest_ts = now_monotonic
+            else:
+                latest_ts = self._latest_ts or now_monotonic
+            age_s = max(0.0, now_monotonic - latest_ts)
+
             with self._pose_lock:
                 self._latest_raw_wxyz = raw_wxyz
                 self._latest_ee_wxyz = ee_pose
                 self._latest_world_tracker_wxyz = tracker_pose
-                self._latest_ts = time.monotonic()
-                self._stale_warned = False
+                self._latest_ts = latest_ts
+                self._latest_device_timestamp_ns = motion_timestamp_ns
+                self._latest_host_receive_perf_ns = host_receive_perf_ns
+                self._latest_host_receive_unix_ns = host_receive_unix_ns
+                if not duplicate:
+                    self._latest_motion_sequence += 1
+                    self._stale_warned = False
+
+            if self._validation_callback is not None:
+                velocity = velocities[idx] if idx < len(velocities) else [float("nan")] * 6
+                acceleration = accelerations[idx] if idx < len(accelerations) else [float("nan")] * 6
+                try:
+                    self._validation_callback(
+                        {
+                            "valid": True,
+                            "side": self._validation_side,
+                            "tracker_index": idx,
+                            "tracker_serial": self._resolved_sn or self.tracker_sn or "<unknown>",
+                            "motion_timestamp_ns": motion_timestamp_ns,
+                            "host_receive_perf_ns": host_receive_perf_ns,
+                            "host_receive_unix_ns": host_receive_unix_ns,
+                            "motion_sequence": self._latest_motion_sequence,
+                            "duplicate": duplicate,
+                            "age_s": age_s,
+                            "stale": age_s > STALE_WARN_THRESHOLD_S,
+                            "raw_pose_wxyz": raw_wxyz.copy(),
+                            "world_tracker_pose_wxyz": tracker_pose.copy(),
+                            "tcp_pose_wxyz": ee_pose.copy(),
+                            "velocity": list(velocity),
+                            "acceleration": list(acceleration),
+                        }
+                    )
+                except Exception as e:  # pragma: no cover — validation must not kill teleop
+                    self.logger.warn(f"validation callback failed: {e}")
+
+    def _emit_validation_missing(self, reason: str) -> None:
+        if self._validation_callback is None:
+            return
+        try:
+            self._validation_callback(
+                {
+                    "valid": False,
+                    "side": self._validation_side,
+                    "tracker_serial": self._resolved_sn or self.tracker_sn or "<unknown>",
+                    "reason": reason,
+                    "host_receive_perf_ns": time.perf_counter_ns(),
+                    "host_receive_unix_ns": time.time_ns(),
+                }
+            )
+        except Exception as e:  # pragma: no cover — validation must not kill teleop
+            self.logger.warn(f"validation callback failed: {e}")
 
     def _resolve_current_index(self, sns: list, n: int) -> int | None:
         """Locate the current index of our pinned tracker. Returns None

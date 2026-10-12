@@ -171,6 +171,42 @@ class TestBimanualActionFeatures:
         assert sided == set(without)
 
 
+class TestTrackerValidationConfig:
+    def test_sidecar_is_off_by_default(self):
+        cfg = BiTaccapGripperConfig(id="taccap_0")
+        assert cfg.tracker_validation_output_dir is None
+        assert cfg.tracker_validation_overwrite is False
+
+    def test_sidecar_does_not_change_the_robot_schema(self, tmp_path):
+        plain = build(
+            BiTaccapGripper,
+            BiTaccapGripperConfig(id="taccap_0"),
+            {"left": "PC1", "right": "PC2"},
+        )
+        validation = build(
+            BiTaccapGripper,
+            BiTaccapGripperConfig(
+                id="taccap_0",
+                tracker_validation_output_dir=str(tmp_path / "pico"),
+            ),
+            {"left": "PC1", "right": "PC2"},
+        )
+        assert validation.observation_features == plain.observation_features
+        assert validation.action_features == plain.action_features
+
+    def test_sidecar_output_directory_cannot_be_blank(self):
+        with pytest.raises(ValueError, match="must not be blank"):
+            BiTaccapGripperConfig(id="taccap_0", tracker_validation_output_dir="  ")
+
+    def test_sidecar_requires_trackers(self, tmp_path):
+        with pytest.raises(ValueError, match="requires.*enable_tracker=true"):
+            BiTaccapGripperConfig(
+                id="taccap_0",
+                enable_tracker=False,
+                tracker_validation_output_dir=str(tmp_path / "pico"),
+            )
+
+
 class TestRobotIdIsRequired:
     """Both configs refuse to build without ``--robot.id``. It reaches the log
     prefix, the calibration filename and the recorded hardware manifest, so an
